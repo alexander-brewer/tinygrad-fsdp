@@ -73,6 +73,7 @@ def main():
   parser.add_argument("--prompt", type=str, default="Explain Fully Sharded Data Parallel in one sentence.",
                       help="Short prompt to drive the tiny training step.")
   parser.add_argument("--profile", action="store_true", help="Enable tinygrad profiling context.")
+  parser.add_argument("--quantize", choices=["int8", "nf4", "fp8", "float16"], help="Optional quantization to reduce memory.")
   args = parser.parse_args()
 
   assert args.shard >= 2, "Use at least two GPUs to prove FSDP works."
@@ -82,7 +83,8 @@ def main():
   model_path = args.model or ensure_weights(args.size, args.cache_dir)
   tokenizer = Tokenizer(str((model_path if model_path.is_dir() else model_path.parent) / "tokenizer.model"))
 
-  model = build_transformer(model_path, model_size=args.size, device=devices, max_context=args.seq_len, load_weights=True)
+  model = build_transformer(model_path, model_size=args.size, device=devices, max_context=args.seq_len, load_weights=True,
+                           quantize=args.quantize)
   params = get_parameters(model)
   param_bytes = sum(p.uop.size * p.dtype.itemsize for p in params)
   print(colored(f"Sharded params: {param_bytes/1e9:.2f} GB across {len(devices)} devices", "yellow"))
