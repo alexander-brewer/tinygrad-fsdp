@@ -14,7 +14,7 @@ from tinygrad.mixin import OpMixin
 from tinygrad.mixin.movement import _align_left
 from tinygrad.uop.ops import smax, smin, resolve, UOp, Ops, sint, identity_element, all_metadata, _index_to_concrete_int, sint_to_uop, Variable
 from tinygrad.engine.schedule import ExecItem, complete_create_schedule_with_vars
-from tinygrad.device import Device, Buffer
+from tinygrad.device import Device, Buffer, MultiBuffer
 from tinygrad.engine.realize import run_schedule
 
 # TODO: this should be the only usage of Device
@@ -160,7 +160,6 @@ class Tensor(OpMixin):
 
     # by this point, it has to be a UOp
     if not isinstance(data, UOp): raise RuntimeError(f"can't create Tensor from {data!r} with type {type(data)}")
-
     # data might be on a different device
     if isinstance(_device, str): self.uop:UOp = data if data.device == _device else data.copy_to_device(_device)
     # if device is a tuple, we should have/construct a multi-device UOp
@@ -301,7 +300,9 @@ class Tensor(OpMixin):
   def _buffer(self) -> Buffer:
     x = self.cast(self.dtype.base).contiguous()
     if isinstance(self.device, tuple): x = x.to("CPU")
-    return cast(Buffer, x.realize().uop.base.buffer).ensure_allocated()
+    buf = x.realize().uop.base.buffer
+    if isinstance(buf, MultiBuffer): buf = buf.bufs[0]
+    return cast(Buffer, buf).ensure_allocated()
   def _data(self) -> memoryview: return self._buffer().as_buffer()
 
   def data(self) -> memoryview:

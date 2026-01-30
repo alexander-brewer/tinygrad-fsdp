@@ -105,6 +105,10 @@ _tensor_spec = PatternMatcher([
   # COPY/ALLREDUCE/MULTI/ENCDEC
   (UPat(Ops.COPY, name="copy", src=(UPat.var("x"), UPat(Ops.DEVICE)), arg=None), lambda copy,x: copy.dtype == x.dtype),
   (UPat(Ops.ALLREDUCE, name="red", src=(UPat.var("x"), UPat(Ops.DEVICE))), lambda red,x: red.dtype == x.dtype and isinstance(red.arg, Ops)),
+  (UPat(Ops.ALLGATHER, name="ag", src=(UPat.var("x"), UPat(Ops.DEVICE))),
+   lambda ag,x: ag.dtype == x.dtype and isinstance(ag.arg, int)),
+  (UPat(Ops.REDUCESCATTER, name="rs", src=(UPat.var("x"), UPat(Ops.DEVICE))),
+   lambda rs,x: rs.dtype == x.dtype and isinstance(rs.arg, tuple) and len(rs.arg) == 2 and isinstance(rs.arg[0], Ops) and isinstance(rs.arg[1], int)),
   (UPat(Ops.MULTI, name="multi"), lambda multi: all(x.dtype == multi.dtype for x in multi.src) and isinstance(multi.arg, int)),
   (UPat(Ops.ENCDEC, name="x"), lambda x: len(x.src) >= 2), # state + inbuffer
 

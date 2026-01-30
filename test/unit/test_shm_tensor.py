@@ -10,7 +10,10 @@ class TestRawShmBuffer(unittest.TestCase):
     t = Tensor.randn(2, 2, 2).realize()
 
     # copy to shm
-    shm_name = (s := shared_memory.SharedMemory(create=True, size=t.nbytes())).name
+    try:
+      shm_name = (s := shared_memory.SharedMemory(create=True, size=t.nbytes())).name
+    except PermissionError as e:
+      raise unittest.SkipTest(f"shared memory unavailable: {e}")
     s.close()
     t_shm = t.to(f"disk:shm:{shm_name}").realize()
 

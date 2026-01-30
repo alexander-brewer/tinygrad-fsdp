@@ -29,7 +29,7 @@ N = 128
 def _test_allreduce(t:Tensor):
   aa = (t[0:64] + t[64:128] + t[128:192] + t[192:256]).repeat([4,1]).realize()
   ts = t.shard(devices_4, 0).realize()
-  b = Tensor(UOp.allreduce(ts.uop, Ops.ADD, ts.device))
+  b = Tensor(UOp.allreduce(ts.uop, Ops.ADD, ts.device), device=ts.device)
   b.realize()
   return aa, b
 
@@ -283,6 +283,19 @@ class TestMultiTensor(unittest.TestCase):
         a,b = jit_allreduce(Tensor.rand(256, 256))
         np.testing.assert_almost_equal(a.numpy(), b.numpy(), decimal=5)
 
+  def test_allgather(self):
+    t = Tensor.rand(256).realize()
+    shard = t.shard(devices_2, 0).realize()
+    gathered = Tensor(UOp.allgather(shard.uop, axis=shard.uop.axis, device=shard.device), device=shard.device).realize()
+    np.testing.assert_allclose(gathered.numpy(), t.numpy())
+
+  def test_reducescatter(self):
+    t = Tensor.rand(256).realize()
+    replicated = t.to(devices_2).realize()
+    reduced = Tensor(UOp.reducescatter(replicated.uop, Ops.ADD, axis=0, device=replicated.device), device=replicated.device).realize()
+    expected = (t.numpy() * len(devices_2))[:reduced.shape[0]]
+    np.testing.assert_allclose(reduced.numpy(), expected)
+
   def test_multitensor_jit_input(self):
     @TinyJit
     def f(x): return (x+1).contiguous().sum()
@@ -306,9 +319,9 @@ class TestMultiTensor(unittest.TestCase):
         shape = tuple([(n if i == 0 else 1) * random.randint(1, 10) for i in range(random.randint(1, 4))])
         t = Tensor.rand(shape).shard_(tuple([d0, d1, d2, d3][:n]), 0)
         with Context(RING=0):
-          a = Tensor(UOp.allreduce(t.uop, Ops.ADD, t.device))
+          a = Tensor(UOp.allreduce(t.uop, Ops.ADD, t.device), device=t.device)
         with Context(RING=2):
-          b = Tensor(UOp.allreduce(t.uop, Ops.ADD, t.device))
+          b = Tensor(UOp.allreduce(t.uop, Ops.ADD, t.device), device=t.device)
         diff = a - b
         mean_err = diff.reshape((prod(diff.shape),)).abs().mean().numpy()
         max_err = diff.reshape((prod(diff.shape),)).abs().max().numpy()

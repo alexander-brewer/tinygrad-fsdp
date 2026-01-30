@@ -4,9 +4,10 @@ from dataclasses import dataclass, replace, field
 from tinygrad.helpers import all_same, colored, DEBUG, GlobalCounters, ansilen, BEAM, NOOPT, all_int, CAPTURING, Metadata, TRACEMETA, TracingKey
 from tinygrad.helpers import DEVECTORIZE, time_to_str, VALIDATE_WITH_CPU, cpu_profile, PROFILE, ProfilePointEvent, cpu_events, prod, Context, unwrap
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, sym_infer
-from tinygrad.device import Device, Buffer
+from tinygrad.device import Device, Buffer, MultiBuffer
 from tinygrad.renderer import ProgramSpec, Estimates
 from tinygrad.codegen import get_program
+from tinygrad.runtime.collectives import host_allgather, host_reducescatter
 
 # **************** Runners ****************
 
@@ -19,6 +20,16 @@ class Runner:
     return self(rawbufs, {} if var_vals is None else var_vals)
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int], wait=False) -> float|None:
     raise NotImplementedError("override this")
+
+class CollectiveRunner(Runner):
+  def __init__(self, name:str, devices:tuple[str, ...], ast:UOp):
+    super().__init__(colored(name, "yellow"), devices[0])
+    self.devices, self.ast = devices, ast
+  @staticmethod
+  def _as_multi(buf):
+    if not isinstance(buf, MultiBuffer): raise RuntimeError(f"collective runner expects MultiBuffer, got {type(buf)}")
+    for b in buf.bufs: b.ensure_allocated()
+    return buf
 
 def optimize_local_size(_prg:Callable, global_size:list[int], rawbufs:list[Buffer]) -> list[int]:
   test_rawbuffers = [Buffer(rawbufs[0].device, rawbufs[0].size, rawbufs[0].dtype).allocate(), *rawbufs[1:]] if rawbufs[0] in rawbufs[1:] else rawbufs
@@ -104,6 +115,26 @@ class EncDec(Runner):
       Device[rawbufs[0].device].synchronize()
       return time.perf_counter() - st
 
+class AllGatherRunner(CollectiveRunner):
+  def __init__(self, ast:UOp):
+    devices = cast(tuple[str, ...], ast.device)
+    super().__init__(f"allgather x{len(devices)}", devices, ast)
+  def __call__(self, rawbufs:list[Buffer|MultiBuffer], var_vals:dict[str, int], wait=False):
+    out_mb = self._as_multi(rawbufs[0])
+    in_mb = self._as_multi(rawbufs[1] if len(rawbufs) > 1 else rawbufs[0])
+    host_allgather(self.ast, out_mb, in_mb, var_vals)
+    if wait: Device[out_mb.bufs[0].device].synchronize()
+
+class ReduceScatterRunner(CollectiveRunner):
+  def __init__(self, ast:UOp):
+    devices = cast(tuple[str, ...], ast.device)
+    super().__init__(f"reducescatter x{len(devices)}", devices, ast)
+  def __call__(self, rawbufs:list[Buffer|MultiBuffer], var_vals:dict[str, int], wait=False):
+    out_mb = self._as_multi(rawbufs[0])
+    in_mb = self._as_multi(rawbufs[1] if len(rawbufs) > 1 else rawbufs[0])
+    host_reducescatter(self.ast, out_mb, in_mb, var_vals)
+    if wait: Device[out_mb.bufs[0].device].synchronize()
+
 # **************** method cache ****************
 
 method_cache: dict[tuple[str, type, bytes, tuple[int, ...], bool], CompiledRunner] = {}
@@ -130,12 +161,14 @@ si_lowerer = PatternMatcher([
       if hasattr(alc:=Device[ctx[0].device].allocator, '_transfer') and alc.supports_transfer and all_same([x.device.split(":")[0] for x in ctx]) \
       else BufferCopy(ctx[0].nbytes, ctx[0].device, ctx[1].device))),
   (UPat(Ops.ENCDEC, name="encdec"), lambda ctx,encdec: EncDec(encdec, ctx[0].nbytes, ctx[1].device)),
+  (UPat(Ops.ALLGATHER, name="ag"), lambda ctx,ag: AllGatherRunner(ag)),
+  (UPat(Ops.REDUCESCATTER, name="rs"), lambda ctx,rs: ReduceScatterRunner(rs)),
 ])
 
 @dataclass
 class ExecItem:
   ast: UOp
-  bufs: list[Buffer|None] = field(default_factory=list)
+  bufs: list[Buffer|MultiBuffer|None] = field(default_factory=list)
   metadata: tuple[Metadata, ...] = ()
   fixedvars: dict[str, int] = field(default_factory=dict)
   prg: Runner|None = None
@@ -156,11 +189,20 @@ class ExecItem:
     if self.prg is None: self.lower()
     assert self.prg is not None
     var_vals = self.fixedvars if _var_vals is None else (_var_vals|self.fixedvars)
-    # reorder bufs to match program globals if needed
-    _bufs = [self.bufs[i] for i in self.prg.p.globals] if isinstance(self.prg, CompiledRunner) else self.bufs
-    bufs = cast(list[Buffer], [unwrap(x) for x in _bufs] if jit else [unwrap(x).ensure_allocated() for x in _bufs])
+    if isinstance(self.prg, CollectiveRunner):
+      bufs = [unwrap(x) for x in self.bufs]
+    else:
+      # reorder bufs to match program globals if needed
+      _bufs = [self.bufs[i] for i in self.prg.p.globals] if isinstance(self.prg, CompiledRunner) else self.bufs
+      bufs = cast(list[Buffer], [unwrap(x) for x in _bufs] if jit else [unwrap(x).ensure_allocated() for x in _bufs])
     if PROFILE:
-      payload = {"metadata":self.metadata, "var_vals":var_vals, "bufs":[b.trace_num for b in bufs], "name":self.prg.display_name}
+      buf_trace: list[int] = []
+      for b in bufs:
+        if isinstance(self.prg, CollectiveRunner) and isinstance(b, MultiBuffer):
+          buf_trace.extend([bb.trace_num for bb in b.bufs])
+        else:
+          buf_trace.append(cast(Buffer, b).trace_num)
+      payload = {"metadata":self.metadata, "var_vals":var_vals, "bufs":buf_trace, "name":self.prg.display_name}
       payload["outputs"], payload["inputs"] = (self.prg.p.outs, self.prg.p.ins) if isinstance(self.prg, CompiledRunner) else ([0], [1])
       cpu_events.append(ProfilePointEvent(self.prg.device, "exec", len(cpu_events), payload))
     et = self.prg(bufs, var_vals, wait=wait or DEBUG >= 2)

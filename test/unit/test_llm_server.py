@@ -27,7 +27,10 @@ class TestLLMServer(unittest.TestCase):
     from tinygrad.apps.llm import Handler
     from tinygrad.helpers import TCPServerWithReuse
 
-    cls.server = TCPServerWithReuse(('127.0.0.1', 0), Handler)
+    try:
+      cls.server = TCPServerWithReuse(('127.0.0.1', 0), Handler)
+    except PermissionError as e:
+      raise unittest.SkipTest(f"socket bind not permitted: {e}")
     cls.port = cls.server.server_address[1]
     cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
     cls.server_thread.start()
@@ -38,8 +41,9 @@ class TestLLMServer(unittest.TestCase):
 
   @classmethod
   def tearDownClass(cls):
-    cls.server.shutdown()
-    cls.server.server_close()
+    if hasattr(cls, "server"):
+      cls.server.shutdown()
+      cls.server.server_close()
 
   def test_chat_completion_stream(self):
     stream = self.client.chat.completions.create(

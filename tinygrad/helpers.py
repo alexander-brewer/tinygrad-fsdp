@@ -315,27 +315,53 @@ cache_dir: str = os.path.join(getenv("XDG_CACHE_HOME", os.path.expanduser("~/Lib
 CACHEDB: str = getenv("CACHEDB", os.path.abspath(os.path.join(cache_dir, "cache.db")))
 
 VERSION = 22
-_db_connection = None
-def db_connection():
-  global _db_connection
-  if _db_connection is None:
-    os.makedirs(CACHEDB.rsplit(os.sep, 1)[0], exist_ok=True)
-    _db_connection = sqlite3.connect(CACHEDB, timeout=60, isolation_level="IMMEDIATE")
+_db_connection, _db_path = None, None
+_db_failed_paths:set[str] = set()
+
+def _mark_db_failed():
+  global _db_connection, _db_path
+  if _db_path is not None: _db_failed_paths.add(_db_path)
+  if _db_connection is not None:
+    with contextlib.suppress(Exception): _db_connection.close()
+  _db_connection, _db_path = None, None
+
+def _connect_db(db_path:str) -> sqlite3.Connection|None:
+  try:
+    os.makedirs(db_path.rsplit(os.sep, 1)[0], exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=60, isolation_level="IMMEDIATE")
     # another connection has set it already or is in the process of setting it
     # that connection will lock the database
-    with contextlib.suppress(sqlite3.OperationalError): _db_connection.execute("PRAGMA journal_mode=WAL").fetchone()
-    if DEBUG >= 8: _db_connection.set_trace_callback(print)
+    with contextlib.suppress(sqlite3.OperationalError): conn.execute("PRAGMA journal_mode=WAL").fetchone()
+    if DEBUG >= 8: conn.set_trace_callback(print)
+    return conn
+  except sqlite3.OperationalError as e:
+    if DEBUG >= 1: print(f"diskcache db {db_path} unavailable: {e}")
+    return None
+
+def db_connection():
+  global _db_connection, _db_path
+  if _db_connection is None:
+    for db_path in (CACHEDB, os.path.join(tempfile.gettempdir(), "tinygrad_cache.db")):
+      if db_path in _db_failed_paths: continue
+      if (conn:=_connect_db(db_path)) is not None:
+        _db_connection, _db_path = conn, db_path
+        if db_path != CACHEDB:
+          globals()["CACHEDB"] = db_path
+          os.environ["CACHEDB"] = db_path
+        break
   return _db_connection
 
 def diskcache_clear():
-  cur = db_connection().cursor()
+  if (conn:=db_connection()) is None: return
+  cur = conn.cursor()
   drop_tables = cur.execute("SELECT 'DROP TABLE IF EXISTS ' || quote(name) || ';' FROM sqlite_master WHERE type = 'table';").fetchall()
   cur.executescript("\n".join([s[0] for s in drop_tables] + ["VACUUM;"]))
 
 def diskcache_get(table:str, key:dict|str|int) -> Any:
   if CACHELEVEL < 1: return None
   if isinstance(key, (str,int)): key = {"key": key}
-  cur = db_connection().cursor()
+  if (conn:=db_connection()) is None: return None
+  cur = conn.cursor()
   try:
     res = cur.execute(f"SELECT val FROM '{table}_{VERSION}' WHERE {' AND '.join([f'{x}=?' for x in key.keys()])}", tuple(key.values()))
   except sqlite3.OperationalError:
@@ -347,17 +373,28 @@ _db_tables = set()
 def diskcache_put(table:str, key:dict|str|int, val:Any, prepickled=False):
   if CACHELEVEL < 1: return val
   if isinstance(key, (str,int)): key = {"key": key}
-  conn = db_connection()
-  cur = conn.cursor()
-  if table not in _db_tables:
-    TYPES = {str: "text", bool: "integer", int: "integer", float: "numeric", bytes: "blob"}
-    ltypes = ', '.join(f"{k} {TYPES[type(key[k])]}" for k in key.keys())
-    cur.execute(f"CREATE TABLE IF NOT EXISTS '{table}_{VERSION}' ({ltypes}, val blob, PRIMARY KEY ({', '.join(key.keys())}))")
-    _db_tables.add(table)
-  cur.execute(f"REPLACE INTO '{table}_{VERSION}' ({', '.join(key.keys())}, val) VALUES ({', '.join(['?']*len(key))}, ?)",
-              tuple(key.values()) + (val if prepickled else pickle.dumps(val),))
-  conn.commit()
-  cur.close()
+  for _ in range(2):
+    if (conn:=db_connection()) is None: return val
+    cur = conn.cursor()
+    if table not in _db_tables:
+      TYPES = {str: "text", bool: "integer", int: "integer", float: "numeric", bytes: "blob"}
+      ltypes = ', '.join(f"{k} {TYPES[type(key[k])]}" for k in key.keys())
+      try:
+        cur.execute(f"CREATE TABLE IF NOT EXISTS '{table}_{VERSION}' ({ltypes}, val blob, PRIMARY KEY ({', '.join(key.keys())}))")
+      except sqlite3.OperationalError as e:
+        if DEBUG >= 1: print(f"diskcache table creation failed, retrying with fallback db: {e}")
+        _mark_db_failed()
+        continue
+      _db_tables.add(table)
+    try:
+      cur.execute(f"REPLACE INTO '{table}_{VERSION}' ({', '.join(key.keys())}, val) VALUES ({', '.join(['?']*len(key))}, ?)",
+                  tuple(key.values()) + (val if prepickled else pickle.dumps(val),))
+      conn.commit()
+      cur.close()
+      return val
+    except sqlite3.OperationalError as e:
+      if DEBUG >= 1: print(f"diskcache write failed, retrying with fallback db: {e}")
+      _mark_db_failed()
   return val
 
 def diskcache(func:Callable[..., T]):
@@ -378,15 +415,40 @@ def _ensure_downloads_dir() -> pathlib.Path:
       subprocess.run(["sudo", "chown", "tiny:root", downloads_dir], check=True)
       subprocess.run(["sudo", "chmod", "775", downloads_dir], check=True)
     return downloads_dir
-  return pathlib.Path(cache_dir) / "downloads"
+  for downloads_dir in (pathlib.Path(cache_dir) / "downloads", pathlib.Path(tempfile.gettempdir()) / "tinygrad_downloads"):
+    try:
+      downloads_dir.mkdir(parents=True, exist_ok=True)
+      with tempfile.NamedTemporaryFile(dir=downloads_dir, delete=True): pass
+      return downloads_dir
+    except OSError as e:
+      if DEBUG >= 1: print(f"download cache {downloads_dir} unavailable: {e}")
+  return pathlib.Path(tempfile.gettempdir()) / "tinygrad_downloads"
 
 def fetch(url:str, name:pathlib.Path|str|None=None, subdir:str|None=None, gunzip:bool=False,
           allow_caching=not getenv("DISABLE_HTTP_CACHE"), headers:dict[str, str]={}) -> pathlib.Path:
   if url.startswith(("/", ".")): return pathlib.Path(url)
-  if name is not None and (isinstance(name, pathlib.Path) or '/' in name): fp = pathlib.Path(name)
+  primary_dir = _ensure_downloads_dir()
+  if name is not None and (isinstance(name, pathlib.Path) or '/' in name):
+    fp = pathlib.Path(name)
   else:
     hh = "_"+hashlib.md5(("\n".join(f"{k.strip()}:{v.strip()}" for k,v in sorted(headers.items()))).encode("utf-8")).hexdigest() if headers else ""
-    fp = _ensure_downloads_dir() / (subdir or "") / ((name or hashlib.md5(url.encode('utf-8')).hexdigest()) + hh + (".gunzip" if gunzip else ""))
+    relpath = pathlib.Path(subdir or "") / ((name or hashlib.md5(url.encode('utf-8')).hexdigest()) + hh + (".gunzip" if gunzip else ""))
+    candidates = [primary_dir, pathlib.Path(cache_dir) / "downloads"]
+    for cand_dir in dedup(candidates):
+      cand = cand_dir / relpath
+      if cand.is_file():
+        if cand_dir != primary_dir:
+          try:
+            (primary_dir / relpath.parent).mkdir(parents=True, exist_ok=True)
+            shutil.copy(cand, fp:=primary_dir / relpath)
+          except OSError as e:
+            if DEBUG >= 1: print(f"fallback download cache copy failed: {e}")
+            fp = cand
+        else:
+          fp = cand
+        break
+    else:
+      fp = primary_dir / relpath
   if not fp.is_file() or not allow_caching:
     (_dir := fp.parent).mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "tinygrad 0.12.0", **headers}), timeout=10) as r:
@@ -464,9 +526,16 @@ def wait_cond(cb, *args, value=True, timeout_ms=10000, msg="") -> bool:
 
 # *** ctypes helpers
 
-# TODO: make this work with read only memoryviews (if possible)
 def from_mv(mv:memoryview, to_type:type[ctypes._SimpleCData]=ctypes.c_char) -> ctypes.Array:
-  return ctypes.cast(ctypes.addressof(to_type.from_buffer(mv)), ctypes.POINTER(to_type * len(mv))).contents
+  mv = memoryview(mv)
+  nbytes = mv.nbytes
+  cnt = nbytes // ctypes.sizeof(to_type)
+  if cnt == 0: return (to_type * 0)()
+  arr_t = to_type * cnt
+  try:
+    return arr_t.from_buffer(mv)
+  except (TypeError, BufferError):
+    return arr_t.from_buffer_copy(mv)
 def to_mv(ptr:int, sz:int) -> memoryview: return memoryview((ctypes.c_uint8 * sz).from_address(ptr)).cast("B")
 def mv_address(mv): return ctypes.addressof(ctypes.c_char.from_buffer(mv))
 def to_char_p_p(options: list[bytes], to_type=ctypes.c_char):

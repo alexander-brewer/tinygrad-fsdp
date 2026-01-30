@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Callable, cast, TYPE_CHECKING, Type, Sequence, Iterable, Final
-import sys, time, functools, itertools, math, operator, hashlib, os, types, pickle, pathlib, inspect, weakref, collections
+import sys, time, functools, itertools, math, operator, hashlib, os, types, pickle, pathlib, inspect, weakref, collections, contextlib
 from dataclasses import dataclass
 from enum import Enum, auto
 from tinygrad.uop import Ops, GroupOp
@@ -132,7 +132,11 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
                 kwargs.pop("arg", self.arg), kwargs.pop("tag", self.tag))
     assert len(kwargs) == 0, f"unused kwargs in replace {list(kwargs)}"
     if (self.op, self.dtype, self.src, self.arg, self.tag) == new_args: return self
-    return UOp(*new_args)
+    ret = UOp(*new_args)
+    if self.op is Ops.MULTI and ret.op is Ops.MULTI:
+      if (dev:=self.__dict__.get("_RECURSIVE_PROPERTY__device")) is not None:
+        ret.__dict__["_RECURSIVE_PROPERTY__device"] = dev
+    return ret
   def rtag(self, tag=True): return self.replace(tag=tag)
   @functools.cached_property
   def key(self) -> bytes:
@@ -241,6 +245,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     # NOTE: ssimplify is required because the shape needs to be canonical for broadcasting and same shape checking
     if self.op in GroupOp.Movement.union({Ops.MULTI, Ops.REDUCE_AXIS, Ops.WMMA}):
       ps = self.src[0]._shape
+      if ps is None and self.op is Ops.MULTI and self.src[0].op is Ops.INDEX and self.src[0].src[0]._shape is not None:
+        ps = self.src[0].src[0]._shape
       # TODO: WMMA is used for both axis WMMA and op WMMA. fix this and remove this hack. tested by BERT on AMD LLVM
       if ps is None and self.op is Ops.WMMA: return None
       if ps is None: raise RuntimeError(f"movement op {self.op} requires shape")
@@ -268,15 +274,31 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
         case Ops.FLIP:
           if len(ps) != len(self.marg) or not all(isinstance(x, bool) for x in self.marg): raise ValueError(f"bad flip on {ps}, {self.marg}")
           return ps
-        case Ops.MULTI: return tuple(s*len(self.device) if a == self.axis else s for a,s in enumerate(ps))
+        case Ops.MULTI:
+          devs = self.__dict__.get("_RECURSIVE_PROPERTY__device")
+          if devs is None:
+            with contextlib.suppress(Exception): devs = self.src[0]._device
+          if devs is None:
+            with contextlib.suppress(Exception): devs = self.src[0].device
+          if devs is None: raise RuntimeError("multi missing device")
+          return tuple(s*len(devs) if a == self.axis else s for a,s in enumerate(ps))
         case Ops.REDUCE_AXIS | Ops.WMMA:
           axis_arg = self.arg[1] if self.op is Ops.REDUCE_AXIS else self.arg[7]
           if not isinstance(axis_arg, tuple) or not all(isinstance(x, int) and x>=0 and x<len(ps) for x in axis_arg):
             raise ValueError(f"invalid type for axis: {axis_arg}")
           return tuple(1 if i in axis_arg else s for i,s in enumerate(ps))
 
+    if self.op is Ops.REDUCESCATTER:
+      if (ps:=self.src[0]._shape) is None: return None
+      _, axis = self.arg if isinstance(self.arg, tuple) else (None, self.arg)
+      if not isinstance(axis, int): raise ValueError(f"invalid axis for reducescatter {axis}")
+      parts = len(self.device) if isinstance(self.device, tuple) else 1
+      if isinstance(ps[axis], UOp): return tuple(ssimplify(ps[i]//parts) if i == axis else ps[i] for i in range(len(ps)))
+      if ps[axis] % parts != 0: raise ValueError(f"invalid reducescatter axis {axis} for shape {ps} and parts {parts}")
+      return tuple((ps[i]//parts if i == axis else ps[i]) for i in range(len(ps)))
+
     # elementwise ops keep the shape the same. all inputs with shape must match
-    if self.op in GroupOp.ALU.union({Ops.CAST, Ops.COPY, Ops.ASSIGN, Ops.NOOP, Ops.GROUP, Ops.SINK, Ops.ALLREDUCE, Ops.STORE}):
+    if self.op in GroupOp.ALU.union({Ops.CAST, Ops.COPY, Ops.ASSIGN, Ops.NOOP, Ops.GROUP, Ops.SINK, Ops.ALLREDUCE, Ops.ALLGATHER, Ops.REDUCESCATTER, Ops.STORE}):
       # TODO: remove this hack for 3 op assign
       input_shapes = [x._shape for x in (self.src[:2] if self.op is Ops.ASSIGN else self.src) if x._shape is not None]
       if len(input_shapes) == 0: return None
@@ -466,6 +488,18 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def allreduce(self, op, device:str|tuple[str, ...]|UOp):
     assert isinstance(self.device, tuple), f"allreduce must be on tuple {self.device} isn't"
     return UOp(Ops.ALLREDUCE, self.dtype, (self, UOp(Ops.DEVICE, arg=device) if not isinstance(device, UOp) else device), op)
+  def allgather(self, axis:int|None=None, device:str|tuple[str, ...]|UOp|None=None):
+    axis = self.axis if axis is None else axis
+    if axis is None: raise RuntimeError("allgather requires an axis")
+    dev = self.device if device is None else device
+    assert isinstance(dev, tuple), f"allgather must be on tuple {dev} isn't"
+    return UOp(Ops.ALLGATHER, self.dtype, (self, UOp(Ops.DEVICE, arg=dev) if not isinstance(dev, UOp) else dev), axis)
+  def reducescatter(self, op, axis:int|None=None, device:str|tuple[str, ...]|UOp|None=None):
+    axis = self.axis if axis is None else axis
+    if axis is None: raise RuntimeError("reducescatter requires an axis")
+    dev = self.device if device is None else device
+    assert isinstance(dev, tuple), f"reducescatter must be on tuple {dev} isn't"
+    return UOp(Ops.REDUCESCATTER, self.dtype, (self, UOp(Ops.DEVICE, arg=dev) if not isinstance(dev, UOp) else dev), (op, axis))
   def overflows(self, dtype:DType) -> bool: return self.vmin < dtype.min or dtype.max < self.vmax
 
   def split_uop(self:UOp, sep:Ops):
@@ -478,7 +512,10 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def multi(self, axis:int|None):
     assert isinstance(self.device, tuple), f"multi device must be tuple, {self.device} isn't"
     assert axis is not None, "multi None is no longer supported"
-    return UOp(Ops.MULTI, self.dtype, (self,), axis)
+    ret = UOp(Ops.MULTI, self.dtype, (self,), axis)
+    try: ret.__dict__["_RECURSIVE_PROPERTY__device"] = self.device
+    except Exception: pass
+    return ret
 
   @property
   def bounds(self):
@@ -490,6 +527,10 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if self.op is Ops.MULTI: return self.arg
     # NOTE: they all have to share an axis, we always choose [-1]
     if self.op in GroupOp.ALU: return axes[-1] if (axes := dedup([x.axis for x in self.src if x.axis is not None])) else None
+    if self.op is Ops.ALLGATHER: return None
+    if self.op is Ops.REDUCESCATTER:
+      _, axis = self.arg if isinstance(self.arg, tuple) else (None, self.arg)
+      return axis
     if len(self.src) == 0: return None
     src_axis = self.src[0].axis
     if self.op is Ops.REDUCE_AXIS: return None if src_axis is not None and src_axis in self.arg[1] else src_axis
@@ -599,7 +640,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       assert isinstance(self.src[0].device, tuple), f"mselect must be on tuple device, getting {self.src[0].device}"
       return self.src[0].device[self.arg]
     if self.op is Ops.MSTACK: return tuple(cast(str, x.device) for x in self.src)
-    if self.op in {Ops.COPY, Ops.BUFFER, Ops.ALLREDUCE}: return self.src[1].device
+    if self.op is Ops.MULTI: return self.src[0]._device
+    if self.op in {Ops.COPY, Ops.BUFFER, Ops.ALLREDUCE, Ops.ALLGATHER, Ops.REDUCESCATTER}: return self.src[1].device
     for x in self.src:
       if x._device is not None: return x._device
     return None

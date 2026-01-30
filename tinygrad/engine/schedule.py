@@ -192,10 +192,13 @@ def complete_create_schedule_with_vars(big_sink:UOp) -> tuple[dict[UOp, UOp], li
       buffers[buf_uops[0]] = base.view(buf_uops[0].arg, si.ast.dtype, si.ast.arg[1]*base.dtype.itemsize)
     ubufs = tuple(b.buffer for b in buf_uops)
     if any(isinstance(x, MultiBuffer) for x in ubufs):
-      assert all(isinstance(x, MultiBuffer) for x in ubufs), "kernel must all be multibuffer"
-      dnums = [x for x in si.ast.variables() if x.arg[0] == '_device_num']
-      for j, bufs in enumerate(zip(*[x.bufs for x in cast(tuple[MultiBuffer, ...], ubufs)])):
-        schedule.append(ExecItem(si.ast, list(bufs), si.metadata, si.fixedvars | ({dnums[0].expr:j} if len(dnums) else {})))
+      if si.ast.op in {Ops.ALLGATHER, Ops.REDUCESCATTER}:
+        schedule.append(ExecItem(si.ast, list(ubufs), si.metadata, si.fixedvars))
+      else:
+        assert all(isinstance(x, MultiBuffer) for x in ubufs), "kernel must all be multibuffer"
+        dnums = [x for x in si.ast.variables() if x.arg[0] == '_device_num']
+        for j, bufs in enumerate(zip(*[x.bufs for x in cast(tuple[MultiBuffer, ...], ubufs)])):
+          schedule.append(ExecItem(si.ast, list(bufs), si.metadata, si.fixedvars | ({dnums[0].expr:j} if len(dnums) else {})))
     else:
       # ONE -> ONE
       schedule.append(ExecItem(si.ast, list(ubufs), si.metadata, si.fixedvars))
