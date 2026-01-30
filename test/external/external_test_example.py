@@ -1,5 +1,5 @@
 import unittest
-from tinygrad import Device
+from tinygrad.device import Device
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import getenv, CI, OSX
 
