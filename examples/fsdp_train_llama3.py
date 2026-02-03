@@ -14,7 +14,7 @@ Example (after weights are in ~/.cache/tinygrad/DeepSeek-R1-Distill-Llama-70B):
 
 from pathlib import Path
 import argparse, time
-from tinygrad import Tensor, Device, GlobalCounters
+from tinygrad import Tensortt, Device, GlobalCounters
 from tinygrad.helpers import fetch, colored, Timing, Profiling
 from tinygrad.nn import optim
 from tinygrad.nn.state import get_parameters
@@ -74,6 +74,7 @@ def main():
                       help="Short prompt to drive the tiny training step.")
   parser.add_argument("--profile", action="store_true", help="Enable tinygrad profiling context.")
   parser.add_argument("--quantize", choices=["int8", "nf4", "fp8", "float16"], help="Optional quantization to reduce memory.")
+  parser.add_argument("--disable_kv_cache", action="store_true", help="Disable KV cache to avoid sharded assign issues.", default=True)
   args = parser.parse_args()
 
   assert args.shard >= 2, "Use at least two GPUs to prove FSDP works."
@@ -84,7 +85,7 @@ def main():
   tokenizer = Tokenizer(str((model_path if model_path.is_dir() else model_path.parent) / "tokenizer.model"))
 
   model = build_transformer(model_path, model_size=args.size, device=devices, max_context=args.seq_len, load_weights=True,
-                           quantize=args.quantize)
+                           quantize=args.quantize, disable_kv_cache=args.disable_kv_cache)
   params = get_parameters(model)
   param_bytes = sum(p.uop.size * p.dtype.itemsize for p in params)
   print(colored(f"Sharded params: {param_bytes/1e9:.2f} GB across {len(devices)} devices", "yellow"))
