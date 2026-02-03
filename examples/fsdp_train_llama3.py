@@ -14,7 +14,7 @@ Example (after weights are in ~/.cache/tinygrad/DeepSeek-R1-Distill-Llama-70B):
 
 from pathlib import Path
 import argparse, time
-from tinygrad import Tensortt, Device, GlobalCounters
+from tinygrad import Tensor, Device, GlobalCounters
 from tinygrad.helpers import fetch, colored, Timing, Profiling
 from tinygrad.nn import optim
 from tinygrad.nn.state import get_parameters
