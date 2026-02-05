@@ -50,6 +50,14 @@ class TestMultiTensor(unittest.TestCase):
     grad = X.sum().gradient(X)[0]
     grad.realize()
 
+  def test_allreduce_backward_axis(self):
+    X = Tensor.ones(256).contiguous().realize().shard(devices_2, 0)
+    Y = Tensor(UOp.allreduce(X.uop, Ops.ADD, X.device), device=X.device)
+    Y.sum().backward()
+    assert X.grad is not None
+    self.assertEqual(X.grad.device, X.device)
+    self.assertEqual(X.grad.uop.axis, X.uop.axis)
+
   def test_shard(self):
     X = Tensor.ones(256).contiguous().realize()
     X.shard_(devices_2, 0)

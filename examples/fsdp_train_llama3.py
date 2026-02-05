@@ -56,11 +56,28 @@ def _suspect_router_names(names):
   return [name for name in names if any(flag in name for flag in flags)]
 
 
+def _grad_axis_mismatch(param: Tensor) -> bool:
+  if param.grad is None: return False
+  if not isinstance(param.device, tuple): return False
+  if not isinstance(param.grad.device, tuple): return True
+  return param.uop.axis != param.grad.uop.axis
+
+
 def log_grad_status(named_params, log_path: Path|None, loss: Tensor|None = None):
   trainable = _names_with_flag(named_params, lambda t: t.requires_grad is True)
   frozen = _names_with_flag(named_params, lambda t: t.requires_grad is False)
   unknown = _names_with_flag(named_params, lambda t: t.requires_grad is None)
   missing = [name for name, t in named_params if t.requires_grad and t.grad is None]
+  mismatched = []
+  for name, t in named_params:
+    if not _grad_axis_mismatch(t): continue
+    if t.grad is None:
+      mismatched.append(name)
+      continue
+    if not isinstance(t.grad.device, tuple):
+      mismatched.append(f"{name} (param axis {t.uop.axis}, grad device {t.grad.device})")
+    else:
+      mismatched.append(f"{name} (param axis {t.uop.axis}, grad axis {t.grad.uop.axis})")
 
   lines = []
   summary = f"Grad status: total={len(named_params)} trainable={len(trainable)} frozen={len(frozen)} unknown={len(unknown)}"
@@ -69,6 +86,7 @@ def log_grad_status(named_params, log_path: Path|None, loss: Tensor|None = None)
     summary += f" loss_uop={loss.uop.op}"
   lines.append(summary)
   lines.append(f"missing_grads_count={len(missing)}")
+  lines.append(f"mismatched_grads_count={len(mismatched)}")
   if frozen:
     lines.append("FROZEN_PARAMS (requires_grad=False):")
     lines.extend(frozen)
@@ -78,6 +96,9 @@ def log_grad_status(named_params, log_path: Path|None, loss: Tensor|None = None)
   if missing:
     lines.append("MISSING_GRADS (requires_grad=True, grad=None):")
     lines.extend(missing)
+  if mismatched:
+    lines.append("MISMATCHED_GRADS (param axis != grad axis):")
+    lines.extend(mismatched)
 
   suspect = _suspect_router_names(missing or frozen)
   if suspect:
@@ -111,6 +132,7 @@ def train_step(model, x: Tensor, y: Tensor, opt, params, named_params, profile: 
       log_grad_status(named_params, grad_log, loss)
       setattr(train_step, "_logged_grad_status", True)
     missing = missing_grad_names(named_params)
+    mismatched = [p for p in params if _grad_axis_mismatch(p)]
     if missing:
       preview = ", ".join(missing[:8])
       msg = f"{len(missing)} params had no grad (e.g. {preview})"
@@ -119,8 +141,18 @@ def train_step(model, x: Tensor, y: Tensor, opt, params, named_params, profile: 
         print(colored(f"WARNING: {msg}. Optimizer will skip them.", "yellow"))
         setattr(train_step, "_warned_missing_grads", True)
       if any(p.grad is None for p in opt.params):
-        trainable = [p for p in params if p.grad is not None]
+        trainable = [p for p in params if p.grad is not None and not _grad_axis_mismatch(p)]
         if not trainable: raise RuntimeError("no parameters have gradients after backward")
+        opt = optim.Adam(trainable, lr=lr)
+    if mismatched:
+      msg = f"{len(mismatched)} params had grad axis mismatch (see grad report)"
+      if strict_grads: raise RuntimeError(msg)
+      if not getattr(train_step, "_warned_mismatch_grads", False):
+        print(colored(f"WARNING: {msg}. Optimizer will skip them.", "yellow"))
+        setattr(train_step, "_warned_mismatch_grads", True)
+      if any(_grad_axis_mismatch(p) for p in opt.params):
+        trainable = [p for p in params if p.grad is not None and not _grad_axis_mismatch(p)]
+        if not trainable: raise RuntimeError("no parameters have usable gradients after backward")
         opt = optim.Adam(trainable, lr=lr)
     opt.step()
   return loss, opt
