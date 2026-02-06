@@ -20,7 +20,7 @@ from tinygrad.helpers import fetch, colored, Timing, Profiling
 from tinygrad.nn import optim
 from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.uop.ops import UOp, Ops
-from examples.llama3 import build_transformer, Tokenizer
+from tinygrad.examples.llama3 import build_transformer, Tokenizer
 
 
 TRACE_OPS = (Ops.MULTI, Ops.ALLREDUCE, Ops.ALLGATHER, Ops.REDUCESCATTER, Ops.COPY)
