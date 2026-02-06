@@ -492,13 +492,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     axis = self.axis if axis is None else axis
     if axis is None: raise RuntimeError("allgather requires an axis")
     dev = self.device if device is None else device
-    assert isinstance(dev, tuple), f"allgather must be on tuple {dev} isn't"
+    if not isinstance(dev, UOp): assert isinstance(dev, tuple), f"allgather must be on tuple {dev} isn't"
     return UOp(Ops.ALLGATHER, self.dtype, (self, UOp(Ops.DEVICE, arg=dev) if not isinstance(dev, UOp) else dev), axis)
   def reducescatter(self, op, axis:int|None=None, device:str|tuple[str, ...]|UOp|None=None):
     axis = self.axis if axis is None else axis
     if axis is None: raise RuntimeError("reducescatter requires an axis")
     dev = self.device if device is None else device
-    assert isinstance(dev, tuple), f"reducescatter must be on tuple {dev} isn't"
+    if not isinstance(dev, UOp): assert isinstance(dev, tuple), f"reducescatter must be on tuple {dev} isn't"
     return UOp(Ops.REDUCESCATTER, self.dtype, (self, UOp(Ops.DEVICE, arg=dev) if not isinstance(dev, UOp) else dev), (op, axis))
   def overflows(self, dtype:DType) -> bool: return self.vmin < dtype.min or dtype.max < self.vmax
 

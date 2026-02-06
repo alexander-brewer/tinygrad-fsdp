@@ -68,8 +68,9 @@ class Attention:
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
     bsz, seqlen, _, _ = xq.shape
 
-    # create kv cache
-    if self.max_context:
+    # create kv cache (inference only)
+    use_cache = bool(self.max_context) and not Tensor.training
+    if use_cache:
       kv = Tensor.stack(xk, xv)
       if not hasattr(self, "cache_kv"):
         self.cache_kv = Tensor.zeros(2, bsz, self.max_context, self.n_kv_heads, self.head_dim, dtype=x.dtype).contiguous().realize()

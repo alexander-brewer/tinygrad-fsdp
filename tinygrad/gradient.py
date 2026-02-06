@@ -6,6 +6,25 @@ from tinygrad.helpers import argsort
 def _raise(err: Exception):
   raise err
 
+def _allreduce_grad(ctx:UOp, ret:UOp) -> UOp:
+  if ret.arg is not Ops.ADD: _raise(NotImplementedError("allreduce grad only supports ADD"))
+  grad = ctx.allreduce(ret.arg, ret.src[1])
+  in_axis = ret.src[0].axis
+  if in_axis is None: return grad
+  if not isinstance(ret.src[0].device, tuple): return grad
+  # Keep backward shard layout aligned with the allreduce input.
+  return grad.shard(cast(tuple[str, ...], ret.src[0].device), in_axis)
+
+def _allgather_grad(ctx:UOp, ret:UOp) -> UOp:
+  axis = cast(int, ret.arg)
+  # reducescatter returns per-rank shard shape; wrap with MULTI to recover the source global shape.
+  return ctx.reducescatter(Ops.ADD, axis=axis, device=ret.src[1]).multi(axis)
+
+def _reducescatter_grad(ctx:UOp, ret:UOp) -> UOp:
+  axis = cast(int, ret.arg[1] if isinstance(ret.arg, tuple) else ret.arg)
+  # materialize source global shape before allgather, which then restores replicated layout.
+  return ctx.multi(axis).allgather(axis=axis, device=ret.src[1])
+
 def reduce_gradient(ctx:UOp, ret:UOp, op:Ops):
   def broadcast_to_input(x): return x.reshape(x.shape+(1,)*(len(ret.src[0].shape)-len(x.shape))).expand(ret.src[0].shape)
   if op == Ops.ADD: return (broadcast_to_input(ctx),)
@@ -43,11 +62,9 @@ pm_gradient = PatternMatcher([
   (UPat(Ops.PERMUTE, name="ret"), lambda ctx, ret: (ctx.permute(argsort(ret.marg)),)),
   (UPat(Ops.FLIP, name="ret"), lambda ctx, ret: (ctx.flip([i for i,x in enumerate(ret.marg) if x]),)),
   (UPat(Ops.COPY, name="ret"), lambda ctx, ret: (ctx.copy_to_device(ret.src[0].device), None)),
-  (UPat(Ops.ALLREDUCE, name="ret"), lambda ctx, ret: (ctx.allreduce(ret.arg, ret.src[1]) if ret.arg is Ops.ADD else
-                                                      _raise(NotImplementedError("allreduce grad only supports ADD")), None)),
-  (UPat(Ops.ALLGATHER, name="ret"), lambda ctx, ret: (ctx.reducescatter(Ops.ADD, axis=ret.arg, device=ret.src[1]), None)),
-  (UPat(Ops.REDUCESCATTER, name="ret"), lambda ctx, ret: (ctx.allgather(axis=ret.arg[1] if isinstance(ret.arg, tuple) else ret.arg,
-                                                                         device=ret.src[1]), None)),
+  (UPat(Ops.ALLREDUCE, name="ret"), lambda ctx, ret: (_allreduce_grad(ctx, ret), None)),
+  (UPat(Ops.ALLGATHER, name="ret"), lambda ctx, ret: (_allgather_grad(ctx, ret), None)),
+  (UPat(Ops.REDUCESCATTER, name="ret"), lambda ctx, ret: (_reducescatter_grad(ctx, ret), None)),
   (UPat(Ops.MULTI, name="ret"), lambda ctx, ret: ctx.shard(ret.device, ret.axis).src),
   # NOTE: this is only correct when the KERNEL has a single output
   (UPat(Ops.AFTER), lambda ctx: (ctx, ctx)),

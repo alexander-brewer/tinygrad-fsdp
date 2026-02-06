@@ -51,7 +51,15 @@ class TestMultiTensor(unittest.TestCase):
     grad.realize()
 
   def test_allreduce_backward_axis(self):
-    X = Tensor.ones(256).contiguous().realize().shard(devices_2, 0)
+    X = Tensor.ones(256, requires_grad=True).contiguous().realize().shard(devices_2, 0)
+    Y = Tensor(UOp.allreduce(X.uop, Ops.ADD, X.device), device=X.device)
+    Y.sum().backward()
+    assert X.grad is not None
+    self.assertEqual(X.grad.device, X.device)
+    self.assertEqual(X.grad.uop.axis, X.uop.axis)
+
+  def test_allreduce_backward_axis_none(self):
+    X = Tensor.ones(256, requires_grad=True).contiguous().realize().shard(devices_2, None)
     Y = Tensor(UOp.allreduce(X.uop, Ops.ADD, X.device), device=X.device)
     Y.sum().backward()
     assert X.grad is not None
@@ -297,12 +305,28 @@ class TestMultiTensor(unittest.TestCase):
     gathered = Tensor(UOp.allgather(shard.uop, axis=shard.uop.axis, device=shard.device), device=shard.device).realize()
     np.testing.assert_allclose(gathered.numpy(), t.numpy())
 
+  def test_allgather_backward_axis(self):
+    shard = Tensor.rand(256, requires_grad=True).contiguous().realize().shard(devices_2, 0)
+    gathered = Tensor(UOp.allgather(shard.uop, axis=shard.uop.axis, device=shard.device), device=shard.device)
+    gathered.sum().backward()
+    assert shard.grad is not None
+    self.assertEqual(shard.grad.device, shard.device)
+    self.assertEqual(shard.grad.uop.axis, shard.uop.axis)
+
   def test_reducescatter(self):
     t = Tensor.rand(256).realize()
     replicated = t.to(devices_2).realize()
     reduced = Tensor(UOp.reducescatter(replicated.uop, Ops.ADD, axis=0, device=replicated.device), device=replicated.device).realize()
     expected = (t.numpy() * len(devices_2))[:reduced.shape[0]]
     np.testing.assert_allclose(reduced.numpy(), expected)
+
+  def test_reducescatter_backward_axis(self):
+    replicated = Tensor.rand(256, requires_grad=True).contiguous().realize().to(devices_2)
+    reduced = Tensor(UOp.reducescatter(replicated.uop, Ops.ADD, axis=0, device=replicated.device), device=replicated.device)
+    reduced.sum().backward()
+    assert replicated.grad is not None
+    self.assertEqual(replicated.grad.device, replicated.device)
+    self.assertEqual(replicated.grad.uop.axis, replicated.uop.axis)
 
   def test_multitensor_jit_input(self):
     @TinyJit

@@ -13,13 +13,17 @@ Example (after weights are in ~/.cache/tinygrad/DeepSeek-R1-Distill-Llama-70B):
 """
 
 from pathlib import Path
+from collections import deque
 import argparse, time
 from tinygrad import Tensor, Device, GlobalCounters
 from tinygrad.helpers import fetch, colored, Timing, Profiling
 from tinygrad.nn import optim
 from tinygrad.nn.state import get_parameters, get_state_dict
+from tinygrad.uop.ops import UOp, Ops
 from examples.llama3 import build_transformer, Tokenizer
 
+
+TRACE_OPS = (Ops.MULTI, Ops.ALLREDUCE, Ops.ALLGATHER, Ops.REDUCESCATTER, Ops.COPY)
 
 def ensure_weights(size: str, download_dir: Path) -> Path:
   assert size == "70B", "only the 70B checkpoint is large enough for this smoke test"
@@ -62,6 +66,53 @@ def _grad_axis_mismatch(param: Tensor) -> bool:
   if not isinstance(param.grad.device, tuple): return True
   return param.uop.axis != param.grad.uop.axis
 
+def _layer_idx(name: str) -> int|None:
+  parts = name.split(".")
+  if len(parts) < 2 or parts[0] != "layers": return None
+  return int(parts[1]) if parts[1].isdigit() else None
+
+def _missing_key(item):
+  name, _ = item
+  li = _layer_idx(name)
+  return (li is None, li if li is not None else 10**9, name)
+
+def _first_missing(named_params):
+  missing = [(name, t) for name, t in named_params if t.requires_grad and t.grad is None]
+  if not missing: return None
+  return sorted(missing, key=_missing_key)[0]
+
+def _trace_ops_to_loss(src: UOp, dst: UOp, watch_ops=TRACE_OPS) -> list[str]:
+  if src is dst: return [src.op.name]
+  topo = src.toposort()
+  if dst not in topo: return []
+  consumers: dict[UOp, list[UOp]] = {}
+  for u in topo:
+    for s in u.src: consumers.setdefault(s, []).append(u)
+  prev: dict[UOp, UOp|None] = {dst: None}
+  q = deque([dst])
+  while q:
+    cur = q.popleft()
+    if cur is src: break
+    for nxt in consumers.get(cur, []):
+      if nxt in prev: continue
+      prev[nxt] = cur
+      q.append(nxt)
+  if src not in prev: return []
+  path = [src]
+  while prev[path[-1]] is not None: path.append(prev[path[-1]])
+  traced = [u.op.name for u in path if u.op in watch_ops]
+  return traced if traced else [u.op.name for u in path[:8]]
+
+def _valid_trainable(params):
+  return [p for p in params if p.grad is not None and not _grad_axis_mismatch(p)]
+
+def _ensure_valid_optimizer(opt, params, lr: float):
+  trainable = _valid_trainable(params)
+  if not trainable: raise RuntimeError("no parameters have usable gradients after backward")
+  if len(trainable) != len(opt.params) or any(a is not b for a, b in zip(trainable, opt.params)):
+    return optim.Adam(trainable, lr=lr)
+  return opt
+
 
 def log_grad_status(named_params, log_path: Path|None, loss: Tensor|None = None):
   trainable = _names_with_flag(named_params, lambda t: t.requires_grad is True)
@@ -99,6 +150,19 @@ def log_grad_status(named_params, log_path: Path|None, loss: Tensor|None = None)
   if mismatched:
     lines.append("MISMATCHED_GRADS (param axis != grad axis):")
     lines.extend(mismatched)
+  if loss is not None and (first_missing := _first_missing(named_params)) is not None:
+    name, t = first_missing
+    lines.append(f"FIRST_MISSING_PARAM={name}")
+    if (li := _layer_idx(name)) is not None: lines.append(f"FIRST_MISSING_LAYER={li}")
+    lines.append(f"FIRST_MISSING_REQUIRES_GRAD={t.requires_grad}")
+    lines.append(f"FIRST_MISSING_PARAM_AXIS={t.uop.axis}")
+    lines.append(f"FIRST_MISSING_PARAM_DEVICE={t.device}")
+    in_graph = t.uop in loss.uop.toposort()
+    lines.append(f"FIRST_MISSING_IN_LOSS_GRAPH={in_graph}")
+    if in_graph:
+      traced = _trace_ops_to_loss(loss.uop, t.uop)
+      lines.append("FIRST_MISSING_BACKWARD_TRACE_OPS:")
+      lines.append(" -> ".join(traced))
 
   suspect = _suspect_router_names(missing or frozen)
   if suspect:
@@ -140,20 +204,14 @@ def train_step(model, x: Tensor, y: Tensor, opt, params, named_params, profile: 
       if not getattr(train_step, "_warned_missing_grads", False):
         print(colored(f"WARNING: {msg}. Optimizer will skip them.", "yellow"))
         setattr(train_step, "_warned_missing_grads", True)
-      if any(p.grad is None for p in opt.params):
-        trainable = [p for p in params if p.grad is not None and not _grad_axis_mismatch(p)]
-        if not trainable: raise RuntimeError("no parameters have gradients after backward")
-        opt = optim.Adam(trainable, lr=lr)
     if mismatched:
       msg = f"{len(mismatched)} params had grad axis mismatch (see grad report)"
       if strict_grads: raise RuntimeError(msg)
       if not getattr(train_step, "_warned_mismatch_grads", False):
         print(colored(f"WARNING: {msg}. Optimizer will skip them.", "yellow"))
         setattr(train_step, "_warned_mismatch_grads", True)
-      if any(_grad_axis_mismatch(p) for p in opt.params):
-        trainable = [p for p in params if p.grad is not None and not _grad_axis_mismatch(p)]
-        if not trainable: raise RuntimeError("no parameters have usable gradients after backward")
-        opt = optim.Adam(trainable, lr=lr)
+    if missing or mismatched:
+      opt = _ensure_valid_optimizer(opt, params, lr)
     opt.step()
   return loss, opt
 
