@@ -66,6 +66,25 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(X.grad.device, X.device)
     self.assertEqual(X.grad.uop.axis, X.uop.axis)
 
+  def test_allreduce_backward_axis_attention_linear(self):
+    # Mimics llama attention-style layout: activations sharded on axis 0, projection weights sharded on axis -1 (axis 1).
+    x_data = Tensor.rand(8, 16).numpy()
+    w_data = Tensor.rand(32, 16).numpy()
+
+    X_ref = Tensor(x_data, requires_grad=True)
+    W_ref = Tensor(w_data, requires_grad=True)
+    X_ref.linear(W_ref.transpose()).sum().backward()
+    assert W_ref.grad is not None
+
+    X = Tensor(x_data, requires_grad=True).contiguous().realize().shard(devices_2, 0)
+    W = Tensor(w_data, requires_grad=True).contiguous().realize().shard(devices_2, 1)
+    Y = X.linear(W.transpose())
+    Y.sum().backward()
+    assert W.grad is not None
+    self.assertEqual(W.grad.device, W.device)
+    self.assertEqual(W.grad.uop.axis, W.uop.axis)
+    np.testing.assert_allclose(W.grad.numpy(), W_ref.grad.numpy(), rtol=1e-4, atol=1e-4)
+
   def test_shard(self):
     X = Tensor.ones(256).contiguous().realize()
     X.shard_(devices_2, 0)

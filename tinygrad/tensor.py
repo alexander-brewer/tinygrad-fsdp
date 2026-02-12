@@ -1030,6 +1030,9 @@ class Tensor(OpMixin):
                                        t.uop in all_uops and t.requires_grad]
     # clear contexts
     for t,g in zip(tensors_need_grad, self.gradient(*tensors_need_grad, gradient=gradient, materialize_grads=True)):
+      # keep shard layout aligned for multi-device params so optimizer updates can shard_like safely
+      if isinstance(t.device, tuple) and isinstance(g.device, tuple) and t.uop.axis is not None and g.uop.axis != t.uop.axis:
+        g = g + t.zeros_like(requires_grad=False)
       assert g.shape == t.shape, f"grad shape must match tensor shape, {g.shape!r} != {t.shape!r}"
       if t.grad is None: t.grad = g
       else: t.grad.assign(t.grad + g)
