@@ -1035,8 +1035,14 @@ class Tensor(OpMixin):
       try:
         if g_axis is None: ret = Tensor(g.uop._shard(target_axis).multi(target_axis), device=t.device)
         else:
-          src = g.uop.src[0] if g.uop.op is Ops.MULTI else g.uop
-          aligned = src._unshard(g_axis).allreduce(Ops.ADD, g.uop.device)._shard(target_axis).multi(target_axis)
+          gu = g.uop
+          # Canonicalize non-MULTI grads (for example ALU roots over sharded inputs) before resharding.
+          if gu.op is not Ops.MULTI:
+            from tinygrad.uop.ops import graph_rewrite
+            from tinygrad.schedule.multi import multi_pm
+            gu = graph_rewrite(gu, multi_pm)
+          if gu.op is not Ops.MULTI or (ga:=gu.axis) is None: return g
+          aligned = gu.src[0]._unshard(ga).allreduce(Ops.ADD, gu.device)._shard(target_axis).multi(target_axis)
           ret = Tensor(aligned, device=t.device)
       except Exception:
         return g

@@ -85,6 +85,33 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(W.grad.uop.axis, W.uop.axis)
     np.testing.assert_allclose(W.grad.numpy(), W_ref.grad.numpy(), rtol=1e-4, atol=1e-4)
 
+  def test_allreduce_backward_axis_nonmulti_grad(self):
+    # Regression: grad alignment must handle non-MULTI roots with mismatched sharded axes.
+    A = Tensor.rand(16, 16, requires_grad=True).contiguous().realize().shard(devices_2, 1)
+    B = Tensor.rand(16, 16).contiguous().realize().shard(devices_2, 0)
+    loss = (A * B).sum()
+    raw = loss.gradient(A)[0]
+    self.assertEqual(raw.uop.axis, 0)
+    self.assertNotEqual(raw.uop.op, Ops.MULTI)
+    loss.backward()
+    assert A.grad is not None
+    self.assertEqual(A.grad.device, A.device)
+    self.assertEqual(A.grad.uop.axis, A.uop.axis)
+
+  def test_allreduce_backward_axis_nonmulti_grad_optimizer_step(self):
+    A = Tensor.rand(16, 16, requires_grad=True).contiguous().realize().shard(devices_2, 1)
+    B = Tensor.rand(16, 16).contiguous().realize().shard(devices_2, 0)
+    optim = nn.optim.Adam([A], lr=1e-3)
+
+    with Tensor.train():
+      for _ in range(2):
+        optim.zero_grad()
+        loss = (A * B).sum()
+        loss.backward()
+        assert A.grad is not None
+        self.assertEqual(A.grad.uop.axis, A.uop.axis)
+        optim.step()
+
   def test_allreduce_backward_axis_attention_linear_optimizer_step(self):
     x_data = Tensor.rand(8, 16).numpy()
     w_data = Tensor.rand(32, 16).numpy()
