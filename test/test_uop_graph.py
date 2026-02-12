@@ -97,6 +97,11 @@ class TestModularWraparound(unittest.TestCase):
     t(c, 0)
 
 class TestGraphRewrite(unittest.TestCase):
+  def test_deep_key_no_recursion(self):
+    u = UOp.const(dtypes.int, 0)
+    for i in range(1500): u = u + UOp.const(dtypes.int, i)
+    self.assertEqual(len(u.key), 32)
+
   def test_dedup(self):
     v1 = UOp(Ops.DEFINE_VAR, dtypes.float)
     v2 = UOp(Ops.DEFINE_VAR, dtypes.float)

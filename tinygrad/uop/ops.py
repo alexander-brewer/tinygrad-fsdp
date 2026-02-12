@@ -138,7 +138,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
         ret.__dict__["_RECURSIVE_PROPERTY__device"] = dev
     return ret
   def rtag(self, tag=True): return self.replace(tag=tag)
-  @functools.cached_property
+  @recursive_property
   def key(self) -> bytes:
     return hashlib.sha256(str((self.op, self.dtype, self.arg)).encode() + b"".join([s.key for s in self.src])).digest()
   def __repr__(self): return pretty_print(self)
