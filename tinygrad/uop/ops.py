@@ -522,7 +522,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if self.axis is None: raise RuntimeError("bounds is not defined when axis is None")
     return tuple(itertools.pairwise(itertools.accumulate([self.src[0].shape[self.axis] for _ in self.device], initial=0)))
 
-  @functools.cached_property
+  @recursive_property
   def axis(self) -> int|None:
     if self.op is Ops.MULTI: return self.arg
     # NOTE: they all have to share an axis, we always choose [-1]

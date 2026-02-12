@@ -20,7 +20,11 @@ from tinygrad.helpers import fetch, colored, Timing, Profiling
 from tinygrad.nn import optim
 from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.examples.llama3 import build_transformer, Tokenizer
+try:
+  from examples.llama3 import build_transformer, Tokenizer
+except ImportError:
+  # fallback for environments that expose examples under tinygrad
+  from tinygrad.examples.llama3 import build_transformer, Tokenizer
 
 
 TRACE_OPS = (Ops.MULTI, Ops.ALLREDUCE, Ops.ALLGATHER, Ops.REDUCESCATTER, Ops.COPY)
@@ -60,11 +64,27 @@ def _suspect_router_names(names):
   return [name for name in names if any(flag in name for flag in flags)]
 
 
+def _axis_or_error(uop: UOp) -> tuple[int|None, str|None]:
+  try:
+    return uop.axis, None
+  except RecursionError:
+    return None, "RecursionError"
+  except Exception as e:
+    return None, f"{type(e).__name__}: {e}"
+
+def _axis_text(uop: UOp) -> str:
+  axis, err = _axis_or_error(uop)
+  return str(axis) if err is None else f"error({err})"
+
+
 def _grad_axis_mismatch(param: Tensor) -> bool:
   if param.grad is None: return False
   if not isinstance(param.device, tuple): return False
   if not isinstance(param.grad.device, tuple): return True
-  return param.uop.axis != param.grad.uop.axis
+  p_axis, p_err = _axis_or_error(param.uop)
+  g_axis, g_err = _axis_or_error(param.grad.uop)
+  if p_err is not None or g_err is not None: return True
+  return p_axis != g_axis
 
 def _layer_idx(name: str) -> int|None:
   parts = name.split(".")
@@ -126,9 +146,9 @@ def log_grad_status(named_params, log_path: Path|None, loss: Tensor|None = None)
       mismatched.append(name)
       continue
     if not isinstance(t.grad.device, tuple):
-      mismatched.append(f"{name} (param axis {t.uop.axis}, grad device {t.grad.device})")
+      mismatched.append(f"{name} (param axis {_axis_text(t.uop)}, grad device {t.grad.device})")
     else:
-      mismatched.append(f"{name} (param axis {t.uop.axis}, grad axis {t.grad.uop.axis})")
+      mismatched.append(f"{name} (param axis {_axis_text(t.uop)}, grad axis {_axis_text(t.grad.uop)})")
 
   lines = []
   summary = f"Grad status: total={len(named_params)} trainable={len(trainable)} frozen={len(frozen)} unknown={len(unknown)}"
@@ -155,7 +175,7 @@ def log_grad_status(named_params, log_path: Path|None, loss: Tensor|None = None)
     lines.append(f"FIRST_MISSING_PARAM={name}")
     if (li := _layer_idx(name)) is not None: lines.append(f"FIRST_MISSING_LAYER={li}")
     lines.append(f"FIRST_MISSING_REQUIRES_GRAD={t.requires_grad}")
-    lines.append(f"FIRST_MISSING_PARAM_AXIS={t.uop.axis}")
+    lines.append(f"FIRST_MISSING_PARAM_AXIS={_axis_text(t.uop)}")
     lines.append(f"FIRST_MISSING_PARAM_DEVICE={t.device}")
     in_graph = t.uop in loss.uop.toposort()
     lines.append(f"FIRST_MISSING_IN_LOSS_GRAPH={in_graph}")
