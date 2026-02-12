@@ -1028,11 +1028,22 @@ class Tensor(OpMixin):
     all_uops = self.uop.toposort()
     tensors_need_grad: list[Tensor] = [t for tref in all_tensors if (t:=tref()) is not None and \
                                        t.uop in all_uops and t.requires_grad]
+    def _align_multi_grad_axis(g:Tensor, t:Tensor) -> Tensor:
+      if not (isinstance(t.device, tuple) and isinstance(g.device, tuple)): return g
+      if (target_axis:=t.uop.axis) is None: return g
+      if (g_axis:=g.uop.axis) == target_axis: return g
+      try:
+        if g_axis is None: ret = Tensor(g.uop._shard(target_axis).multi(target_axis), device=t.device)
+        else:
+          src = g.uop.src[0] if g.uop.op is Ops.MULTI else g.uop
+          aligned = src._unshard(g_axis).allreduce(Ops.ADD, g.uop.device)._shard(target_axis).multi(target_axis)
+          ret = Tensor(aligned, device=t.device)
+      except Exception:
+        return g
+      return ret if ret.shape == t.shape else g
     # clear contexts
     for t,g in zip(tensors_need_grad, self.gradient(*tensors_need_grad, gradient=gradient, materialize_grads=True)):
-      # keep shard layout aligned for multi-device params so optimizer updates can shard_like safely
-      if isinstance(t.device, tuple) and isinstance(g.device, tuple) and t.uop.axis is not None and g.uop.axis != t.uop.axis:
-        g = g + t.zeros_like(requires_grad=False)
+      g = _align_multi_grad_axis(g, t)
       assert g.shape == t.shape, f"grad shape must match tensor shape, {g.shape!r} != {t.shape!r}"
       if t.grad is None: t.grad = g
       else: t.grad.assign(t.grad + g)
